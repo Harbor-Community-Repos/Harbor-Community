@@ -335,6 +335,7 @@ export type Settings = {
   playerShaders: Record<string, { enabled: boolean; variant?: string; dir?: string }>;
   preferredSubLangs: string[];
   preferredAudioLangs: string[];
+  preferOriginalAudioLanguage: boolean;
   subFontSize: number;
   subFontColor: string;
   subBorderColor: string;
@@ -382,6 +383,7 @@ export type Settings = {
   communitySyncUrl: string;
   communitySyncOptOut: boolean;
   subtitlesOffByDefault: boolean;
+  englishSubsForForeignOriginal: boolean;
   preferEmbeddedSubs: boolean;
   subtitleAutoUpgrade: boolean;
   subtitlePreselect: boolean;
