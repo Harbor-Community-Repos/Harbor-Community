@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from "react";
 import { clearResume, readResumeEntry } from "./resume";
 import { setItemWithRecovery } from "./storage-recovery";
-import { episodeFromVideoId, type LibraryItem } from "./stremio";
+import { episodeFromVideoId, libraryGetOneStrict, type LibraryItem } from "./stremio";
+import { withItemLock } from "./stremio-item-lock";
 import { cloudLibraryPut } from "./stremio-write-queue";
 import { privateCwProfileId } from "./cw-profile";
 
@@ -96,7 +97,7 @@ function loadDismissed(): void {
     }
   } catch {}
   try {
-    const raw = JSON.parse(profileId ? "[]" : localStorage.getItem(SIMKL_KEY) ?? "[]");
+    const raw = JSON.parse(profileId ? "[]" : (localStorage.getItem(SIMKL_KEY) ?? "[]"));
     const arr = Array.isArray(raw) ? (raw as string[]) : [];
     for (const v of arr) {
       if (typeof v !== "string" || !v) continue;
@@ -210,7 +211,15 @@ export function isCwDismissed(item: LibraryItem): boolean {
   // Newer progress from any source (Harbor resume, Stremio cloud _mtime/lastWatched,
   // Trakt paused_at, Simkl watched_at) un-dismisses even when the video_id is unchanged.
   const activity = itemActivity(item);
-  if (activity > dismissedAt) return false;
+  const { season, episode } = resolveEpisode(item);
+  const playbackActivity = Math.max(
+    parseMs(item.state?.lastWatched),
+    readResumeEntry(item._id, season, episode)?.t ?? 0,
+  );
+  // Library maintenance also changes _mtime. Only playback can undo a
+  // checkpoint dismissal; legacy timestamp-only records retain their behavior.
+  if (dismissedPos.has(item._id) ? playbackActivity > dismissedAt : activity > dismissedAt)
+    return false;
   const vid = dismissedVid.get(item._id);
   const curVid = item.state?.video_id;
   const pos = dismissedPos.get(item._id);
@@ -236,6 +245,7 @@ export function isCwDismissed(item: LibraryItem): boolean {
       if (ahead === null || ahead) return false;
     }
   }
+  if (dismissedPos.has(item._id)) return true;
   if (activity > 0) return activity <= dismissedAt;
   return true;
 }
@@ -244,14 +254,31 @@ export function dismissCw(item: LibraryItem, authKey: string | null): void {
   loadDismissed();
   const id = item._id;
   const now = new Date().toISOString();
-  const nowMs = Date.parse(now);
+  const nowMs = Math.max(Date.parse(now), itemActivity(item), dismissed.get(id) ?? 0);
   dismissed.set(id, nowMs);
+  const previousPos = dismissedPos.get(id);
+  const previousVid = dismissedVid.get(id);
   const dismissVid = item.state?.video_id;
   if (typeof dismissVid === "string" && dismissVid) dismissedVid.set(id, dismissVid);
   else dismissedVid.delete(id);
   if (item.state) {
     const { season, episode } = resolveEpisode(item);
-    dismissedPos.set(id, { s: season, e: episode, p: progressRatio(item) });
+    const pos = { s: season, e: episode, p: progressRatio(item) };
+    const previousAhead = previousPos
+      ? isEpisodeAhead({ season: previousPos.s, episode: previousPos.e }, { season, episode })
+      : null;
+    const sameEpisode =
+      previousPos &&
+      ((previousVid && previousVid === dismissVid) ||
+        (previousPos.s === season && previousPos.e === episode));
+    // Source copies can be dismissed in any order. A stale copy must not
+    // lower the checkpoint and expose the more advanced one underneath it.
+    if (previousPos && (previousAhead === true || (sameEpisode && previousPos.p > pos.p))) {
+      dismissedPos.set(id, previousPos);
+      if (previousVid) dismissedVid.set(id, previousVid);
+    } else {
+      dismissedPos.set(id, pos);
+    }
   } else {
     dismissedPos.delete(id);
   }
@@ -274,11 +301,15 @@ export function dismissCw(item: LibraryItem, authKey: string | null): void {
     item.state.season ?? (kitsuThreeSeg ? 1 : se?.season),
     item.state.episode ?? (kitsuThreeSeg ? Number(vid.split(":")[2]) : se?.episode),
   );
-  void cloudLibraryPut(authKey, {
-    ...item,
-    state: { ...item.state, timeOffset: 0 },
-    _mtime: now,
-  });
+  void withItemLock(id, async () => {
+    const fresh = await libraryGetOneStrict(authKey, id);
+    if (!fresh?.state) return;
+    await cloudLibraryPut(authKey, {
+      ...fresh,
+      state: { ...fresh.state, timeOffset: 0 },
+      _mtime: now,
+    });
+  }).catch(() => {});
 }
 
 function subscribe(cb: () => void): () => void {
