@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { lruSet } from "../cache";
 import { registerEvictable } from "../maintenance";
+import { safeFetch } from "../safe-fetch";
 
 const CACHE_MAX = 1500;
 const MISS_MAX = 1000;
@@ -401,11 +402,78 @@ export async function omdbPrefetch(key: string, imdbId?: string, type?: string):
   inflight.set(imdbId, p);
 }
 
-const seasonRatingsCache = new Map<string, Map<number, number>>();
+const SEASON_CACHE_KEY = "harbor.omdb.episode-ratings.v1";
+const SEASON_FRESH_MS = 24 * 60 * 60_000;
+const SEASON_RETRY_MS = 60_000;
+const SEASON_CACHE_MAX = 200;
+type SeasonRatings = { ratings: Map<number, number>; fetchedAt: number };
+const seasonRatingsCache = new Map<string, SeasonRatings>();
 const seasonRatingsInflight = new Map<string, Promise<Map<number, number>>>();
+const seasonRetryAfter = new Map<string, number>();
+let seasonsLoaded = false;
+
+function loadSeasonRatings() {
+  if (seasonsLoaded) return;
+  seasonsLoaded = true;
+  try {
+    const stored = JSON.parse(localStorage.getItem(SEASON_CACHE_KEY) ?? "{}");
+    for (const [id, entry] of Object.entries(stored)) {
+      if (!/^tt\d+:\d+$/.test(id) || !entry || typeof entry !== "object") continue;
+      const value = entry as { ratings?: unknown; fetchedAt?: unknown };
+      if (!Array.isArray(value.ratings) || typeof value.fetchedAt !== "number") continue;
+      const ratings = new Map<number, number>();
+      for (const pair of value.ratings) {
+        if (!Array.isArray(pair)) continue;
+        const [episode, rating] = pair;
+        if (
+          Number.isInteger(episode) &&
+          episode >= 1 &&
+          Number.isFinite(rating) &&
+          rating > 0 &&
+          rating <= 10
+        )
+          ratings.set(episode, rating);
+      }
+      if (ratings.size)
+        lruSet(seasonRatingsCache, id, { ratings, fetchedAt: value.fetchedAt }, SEASON_CACHE_MAX);
+    }
+  } catch {
+    /* Storage failure must not prevent fresh ratings. */
+  }
+}
+
+function saveSeasonRatings() {
+  try {
+    localStorage.setItem(
+      SEASON_CACHE_KEY,
+      JSON.stringify(
+        Object.fromEntries(
+          [...seasonRatingsCache].map(([id, entry]) => [
+            id,
+            { fetchedAt: entry.fetchedAt, ratings: [...entry.ratings] },
+          ]),
+        ),
+      ),
+    );
+  } catch {
+    /* Keep the in-memory ratings when storage is full. */
+  }
+}
+
+export function omdbSeasonRatingsCached(
+  imdbId?: string,
+  season?: number,
+): Map<number, number> | undefined {
+  if (!imdbId || !season || season < 1) return undefined;
+  loadSeasonRatings();
+  return seasonRatingsCache.get(`${imdbId}:${season}`)?.ratings;
+}
 
 registerEvictable("omdb-season-ratings", (aggressive) => {
-  if (aggressive) seasonRatingsCache.clear();
+  if (aggressive) {
+    seasonRatingsCache.clear();
+    seasonsLoaded = false;
+  }
 });
 
 async function performSeasonFetch(
@@ -415,43 +483,58 @@ async function performSeasonFetch(
   cacheKey: string,
 ): Promise<Map<number, number>> {
   const out = new Map<number, number>();
+  const fallback = () => seasonRatingsCache.get(cacheKey)?.ratings ?? out;
   try {
     const url = `https://www.omdbapi.com/?i=${encodeURIComponent(imdbId)}&Season=${season}&apikey=${encodeURIComponent(key)}`;
-    const res = await fetch(url);
+    const res = await safeFetch(url, { signal: AbortSignal.timeout(8000) });
     if (res.status === 401) {
       markKeyInvalid();
-      return out;
+      return fallback();
     }
-    if (!res.ok) return out;
+    if (!res.ok) return fallback();
     const j = await res.json();
     if (j.Response === "False") {
       const err = String(j.Error ?? "");
       if (/invalid api key|no api key|not activated/i.test(err)) {
         markKeyInvalid();
-        return out;
+        return fallback();
       }
       if (/limit|exceeded|daily|reached/i.test(err)) {
         markExhausted();
-        return out;
+        return fallback();
       }
       bumpBudget();
-      return out;
+      return fallback();
     }
     bumpBudget();
     markKeyValid();
     const eps: Array<{ Episode?: string; imdbRating?: string }> = j.Episodes ?? [];
     for (const e of eps) {
-      const num = parseInt(String(e.Episode ?? ""), 10);
-      const rating =
-        e.imdbRating && e.imdbRating !== "N/A" ? parseFloat(e.imdbRating) : NaN;
-      if (Number.isFinite(num) && Number.isFinite(rating) && rating > 0) {
+      const num = Number(e.Episode);
+      const rating = Number(e.imdbRating);
+      if (
+        Number.isInteger(num) &&
+        num >= 1 &&
+        Number.isFinite(rating) &&
+        rating > 0 &&
+        rating <= 10
+      )
         out.set(num, rating);
-      }
     }
-    lruSet(seasonRatingsCache, cacheKey, out, 200);
-    return out;
+    // An empty/partial provider response must never erase previously valid badges.
+    if (!out.size) return fallback();
+    const merged = new Map(seasonRatingsCache.get(cacheKey)?.ratings);
+    for (const [episode, rating] of out) merged.set(episode, rating);
+    lruSet(
+      seasonRatingsCache,
+      cacheKey,
+      { ratings: merged, fetchedAt: Date.now() },
+      SEASON_CACHE_MAX,
+    );
+    saveSeasonRatings();
+    return merged;
   } catch {
-    return out;
+    return fallback();
   }
 }
 
@@ -461,19 +544,24 @@ export async function omdbSeasonRatings(
   season?: number,
 ): Promise<Map<number, number>> {
   const empty = new Map<number, number>();
-  if (!key || !imdbId || !imdbId.startsWith("tt") || !season || season < 1) {
-    return empty;
-  }
+  if (!imdbId || !/^tt\d+$/.test(imdbId) || !season || season < 1) return empty;
   load();
+  loadSeasonRatings();
   const cacheKey = `${imdbId}:${season}`;
   const cached = seasonRatingsCache.get(cacheKey);
-  if (cached) return cached;
-  if (seasonRatingsInflight.has(cacheKey)) return seasonRatingsInflight.get(cacheKey)!;
+  if (!key || (cached && Date.now() - cached.fetchedAt < SEASON_FRESH_MS))
+    return cached?.ratings ?? empty;
+  // Credentials stay in memory; saved ratings contain only public IDs and scores.
+  const requestKey = JSON.stringify([key, imdbId, season]);
+  const pending = seasonRatingsInflight.get(requestKey);
+  if (pending) return pending;
   rolloverIfStale();
-  if (budget.exhausted || budget.keyInvalid) return empty;
+  if (budget.exhausted || budget.keyInvalid || Date.now() < (seasonRetryAfter.get(requestKey) ?? 0))
+    return cached?.ratings ?? empty;
+  lruSet(seasonRetryAfter, requestKey, Date.now() + SEASON_RETRY_MS, SEASON_CACHE_MAX);
   const promise = performSeasonFetch(key, imdbId, season, cacheKey).finally(() =>
-    seasonRatingsInflight.delete(cacheKey),
+    seasonRatingsInflight.delete(requestKey),
   );
-  seasonRatingsInflight.set(cacheKey, promise);
+  seasonRatingsInflight.set(requestKey, promise);
   return promise;
 }
