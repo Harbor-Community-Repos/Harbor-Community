@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { LogIn } from "lucide-react";
+import { LogIn, Trash2 } from "lucide-react";
 import stremioWordmark from "@/assets/stremio-wordmark.png";
 import { AuthModal } from "@/components/auth-modal";
 import { ContinueCard } from "@/components/continue-card";
@@ -13,9 +13,10 @@ type Props = {
   items: LibraryItem[];
   watchedSet?: Set<string>;
   onDismiss: (item: LibraryItem) => void;
+  onDismissAll: () => void;
 };
 
-export function CWSection({ signedIn, items, watchedSet, onDismiss }: Props) {
+export function CWSection({ signedIn, items, watchedSet, onDismiss, onDismissAll }: Props) {
   const t = useT();
   const [showAuth, setShowAuth] = useState(false);
   const rowKey = useMemo(() => {
@@ -34,6 +35,20 @@ export function CWSection({ signedIn, items, watchedSet, onDismiss }: Props) {
     </button>
   );
 
+  const headerActions = (
+    <div className="flex items-center gap-2">
+      {signInButton}
+      <button
+        type="button"
+        onClick={onDismissAll}
+        className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-edge-soft px-3 py-1 text-[12.5px] font-medium text-ink-subtle transition-colors hover:bg-raised hover:text-ink"
+      >
+        <Trash2 size={13} strokeWidth={2.2} />
+        {t("Clear all")}
+      </button>
+    </div>
+  );
+
   const authModal = showAuth ? <AuthModal onClose={() => setShowAuth(false)} /> : null;
 
   if (items.length > 0) {
@@ -45,7 +60,7 @@ export function CWSection({ signedIn, items, watchedSet, onDismiss }: Props) {
           min={260}
           shape="landscape"
           scrollKey="home:cw"
-          headerRight={signInButton}
+          headerRight={headerActions}
         >
           {items.map((item) => (
             <ContinueCard

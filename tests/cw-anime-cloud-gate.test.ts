@@ -125,10 +125,10 @@ test("absorb cannot resurrect dismissed or ancient entries", () => {
 
 test("dismissing a local anime entry persists past re-absorb", () => {
   const homeDismiss = home.match(
-    /const onDismissCw = useCallback\([\s\S]*?\[authKey\],\s*\);/,
+    /const onDismissCw = useCallback\([\s\S]*?\[authKey, items, externalCw, localCwItems, resurfaceLibrary\],\s*\);/,
   )?.[0];
   assert.ok(homeDismiss, "home onDismissCw must exist");
-  assert.match(homeDismiss, /clearLocalCw\(item\._id\);\s*dismissCw\(item, authKey\);/);
+  assert.match(homeDismiss, /if \(copy\.local\) clearLocalCw\(copy\._id\);\s*dismissCw\(copy, copy\.local \|\| copy\.external \|\| copy\.manualWatched \? null : authKey\);/);
   const animeDismiss = anime.match(/onDismiss=\{\(it\) => \{[\s\S]*?\}\}/)?.[0];
   assert.ok(animeDismiss, "anime room onDismiss must exist");
   assert.match(

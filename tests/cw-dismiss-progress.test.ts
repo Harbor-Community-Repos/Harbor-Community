@@ -29,13 +29,18 @@ const simklIds = (() => {
 })();
 
 // Run the real dismissal module with isolated storage and no cloud/network writes.
-function harness(seed?: string, onChange = () => {}) {
+function harness(
+  seed?: string,
+  onChange = () => {},
+  cloud?: { fresh: LibraryItem; writes: LibraryItem[] },
+) {
   let privateProfile: string | null = null;
   const data = new Map<string, string>();
   if (seed) data.set("harbor.cw.dismissed.v1", seed);
   const resume = new Map<string, { ms: number; t: number }>();
   const key = (id: string, s?: number, e?: number) => `${id}|${s}|${e}`;
   const mocks: Record<string, unknown> = {
+    "./stremio-item-lock": { withItemLock: (_id: string, work: () => Promise<void>) => work() },
     "./cw-profile": { privateCwProfileId: () => privateProfile },
     react: {
       useSyncExternalStore: (subscribe: (notify: () => void) => () => void) => {
@@ -51,12 +56,18 @@ function harness(seed?: string, onChange = () => {}) {
       setItemWithRecovery: (k: string, v: string) => data.set(k, v),
     },
     "./stremio": {
+      libraryGetOneStrict: async () => cloud?.fresh ?? null,
       episodeFromVideoId: (id?: string) => {
         const parts = id?.split(":") ?? [];
         return parts.length === 3 ? { season: Number(parts[1]), episode: Number(parts[2]) } : null;
       },
     },
-    "./stremio-write-queue": { cloudLibraryPut: () => Promise.resolve() },
+    "./stremio-write-queue": {
+      cloudLibraryPut: (_auth: string, value: LibraryItem) => {
+        cloud?.writes.push(value);
+        return Promise.resolve();
+      },
+    },
   };
   const output = ts.transpileModule(read("src/lib/cw-dismiss.ts"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
@@ -74,7 +85,9 @@ function harness(seed?: string, onChange = () => {}) {
   return {
     api: module.exports as typeof import("../src/lib/cw-dismiss"),
     data,
-    setPrivateProfile: (id: string | null) => { privateProfile = id; },
+    setPrivateProfile: (id: string | null) => {
+      privateProfile = id;
+    },
     setResume: (item: LibraryItem, ms: number, t: number) =>
       resume.set(key(item._id, item.state?.season, item.state?.episode), { ms, t }),
     resume,
@@ -116,6 +129,49 @@ test("fresh local resume overrides stale cloud recency for the same episode", ()
   h.api.dismissCw(value, null);
   h.setResume(value, 300, Date.now() + 1000);
   assert.equal(h.api.isCwDismissed(value), false);
+});
+
+test("one dismissal hides entries whose server clock is ahead of the local clock", () => {
+  const h = harness();
+  const value = { ...item(), _mtime: new Date(Date.now() + 60_000).toISOString() };
+  h.api.dismissCw(value, null);
+  assert.equal(h.api.isCwDismissed(value), true);
+});
+
+test("cloud maintenance timestamps cannot resurrect unchanged dismissed progress", () => {
+  const h = harness();
+  const value = item();
+  h.api.dismissCw(value, null);
+  const refreshed = { ...value, _mtime: new Date(Date.now() + 60_000).toISOString() };
+  assert.equal(h.api.isCwDismissed(refreshed), true);
+  assert.equal(
+    h.api.isCwDismissed({ ...refreshed, state: { ...value.state!, timeOffset: 300 } }),
+    false,
+  );
+});
+
+test("dismissing stale source copies cannot lower a title's dismissal checkpoint", () => {
+  const h = harness();
+  const advanced = { ...item(), state: { ...item().state!, timeOffset: 700 } };
+  h.api.dismissCw(advanced, null);
+  h.api.dismissCw(item("trakt"), null);
+  assert.equal(h.api.isCwDismissed(advanced), true);
+  assert.equal(h.api.isCwDismissed(item()), true);
+  h.setResume(advanced, 100, Date.now() + 1000);
+  assert.equal(h.api.isCwDismissed(advanced), false, "fresh playback can still restore it");
+});
+
+test("dismissal clears fresh progress without restoring stale bookmark flags", async () => {
+  const stale = { ...item(), removed: false, temp: false };
+  const fresh = { ...item(), removed: true, temp: true };
+  const writes: LibraryItem[] = [];
+  const h = harness(undefined, undefined, { fresh, writes });
+  h.api.dismissCw(stale, "test");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].removed, true);
+  assert.equal(writes[0].temp, true);
+  assert.equal(writes[0].state?.timeOffset, 0);
 });
 
 test("an older tracker episode cannot undo dismissal, while later episodes and fresh rewatches can", () => {
@@ -161,8 +217,13 @@ function advanceHarness(
   advanced: Map<string, LibraryItem>,
   extra: LibraryItem[],
 ) {
-  const state = [{ privacyOwner: null, profileId: null, simklSession: null, simklEnabled: false },
-    advanced, extra, new Set<string>(), 0];
+  const state = [
+    { privacyOwner: null, profileId: null, simklSession: null, simklEnabled: false },
+    advanced,
+    extra,
+    new Set<string>(),
+    0,
+  ];
   let slot = 0;
   const mocks: Record<string, unknown> = {
     "@/lib/profiles": { useProfiles: () => ({ activeProfile: null, profiles: [] }) },
@@ -173,7 +234,9 @@ function advanceHarness(
       useSyncExternalStore: () => null,
     },
     "@/lib/cw-dismiss": api,
-    "@/lib/settings": { useSettings: () => ({ settings: { cwHideCaughtUp: false, cwSources: { simkl: false } } }) },
+    "@/lib/settings": {
+      useSettings: () => ({ settings: { cwHideCaughtUp: false, cwSources: { simkl: false } } }),
+    },
     "@/lib/providers/jikan": { franchiseDedupKey: (name: string) => name.toLowerCase() },
   };
   const output = ts.transpileModule(read("src/views/home/hooks/use-cw-advance.ts"), {
@@ -250,7 +313,10 @@ test("external backfills preserve dismissals and save true remote progress only 
       "@/lib/resume": {
         readResumeEntry: () => existing,
         saveResumeMs: (...args: unknown[]) => writes.push(args),
-        saveResumeBatch: (entries: any[]) => entries.forEach((e) => writes.push([e.id, e.ms, e.season, e.episode, undefined, e.pct, e.source])),
+        saveResumeBatch: (entries: any[]) =>
+          entries.forEach((e) =>
+            writes.push([e.id, e.ms, e.season, e.episode, undefined, e.pct, e.source]),
+          ),
       },
       "@/lib/providers/anizip": {
         aniZipByMal: async () => null,
@@ -304,9 +370,10 @@ test("episode artwork is opt-in and changing candidates retries the first image"
   assert.match(card, /setImgIdx\(0\);\s*\}, \[candidates\]\)/);
 });
 
-
 test("private-store migration preserves old dismissals only for profiles that existed at upgrade", () => {
-  const h = harness(JSON.stringify({ "tt-test": { t: Date.now(), v: "tt-test:1:2", s: 1, e: 2, p: 0.2 } }));
+  const h = harness(
+    JSON.stringify({ "tt-test": { t: Date.now(), v: "tt-test:1:2", s: 1, e: 2, p: 0.2 } }),
+  );
   h.data.set("harbor.profiles.v1", JSON.stringify({ profiles: [{ id: "alice" }, { id: "bob" }] }));
   h.setPrivateProfile("alice");
   assert.equal(h.api.isCwDismissed(item()), true);
@@ -316,7 +383,11 @@ test("private-store migration preserves old dismissals only for profiles that ex
   assert.equal(h.api.isCwDismissed(item()), false);
   const advanced = { ...item(), state: { ...item().state!, episode: 3, video_id: "tt-test:1:3" } };
   h.setPrivateProfile("alice");
-  assert.equal(h.api.isCwDismissed(advanced), false, "migration retains episode progress for resurfacing");
+  assert.equal(
+    h.api.isCwDismissed(advanced),
+    false,
+    "migration retains episode progress for resurfacing",
+  );
 });
 
 test("migration leaves existing private choices intact, including an empty store", () => {

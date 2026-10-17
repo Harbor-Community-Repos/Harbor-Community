@@ -49,6 +49,7 @@ import { trackEvent } from "@/lib/discover";
 import { publishResumeStates } from "@/lib/hover-preview/store";
 import { readResumeEntry, saveResumeBatch } from "@/lib/resume";
 import { dismissCw, isCwDismissed, useCwDismissVersion } from "@/lib/cw-dismiss";
+import { cwDismissGroup } from "@/lib/cw-dismiss-group";
 import { clearLocalCw, listLocalCw, localCwVersion, subscribeLocalCw } from "@/lib/local-cw";
 import {
   dismissManualWatched,
@@ -803,19 +804,24 @@ export function Home({
 
   const onDismissCw = useCallback(
     (item: LibraryItem) => {
-      if (item.manualWatched) {
-        dismissManualWatched(item._id);
-        return;
+      const copies = cwDismissGroup(
+        item,
+        [...items, ...externalCw, ...localCwItems, ...resurfaceLibrary],
+        franchiseDedupKey,
+        franchiseRootSync,
+      );
+      for (const copy of copies) {
+        if (copy.manualWatched) dismissManualWatched(copy._id);
+        if (copy.local) clearLocalCw(copy._id);
+        dismissCw(copy, copy.local || copy.external || copy.manualWatched ? null : authKey);
       }
-      if (item.local) {
-        clearLocalCw(item._id);
-        dismissCw(item, authKey);
-        return;
-      }
-      dismissCw(item, authKey);
     },
-    [authKey],
+    [authKey, items, externalCw, localCwItems, resurfaceLibrary],
   );
+
+  const onDismissAllCw = useCallback(() => {
+    for (const item of cwItems) onDismissCw(item);
+  }, [cwItems, onDismissCw]);
 
   const { items: favItems } = useMediaFavorites();
   const { items: localItems } = useLocalWatchlist();
@@ -1268,6 +1274,7 @@ export function Home({
             items={cwItems}
             watchedSet={watchedSetCombined}
             onDismiss={onDismissCw}
+            onDismissAll={onDismissAllCw}
           />
         )}
         {settings.homeNewEpisodes && !newEpisodesHidden && (
